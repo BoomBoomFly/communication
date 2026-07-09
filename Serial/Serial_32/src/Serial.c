@@ -1,307 +1,348 @@
 #include "serial.h"
-/**
-  *
-  *UART1 RX B15 TX B14  与蓝牙模块连接，用于无人机与地面通信
-  *UART2 RX A3  TX A2  与串口屏连接，用于32与串口屏通信
-  *
-  *
-  *
-  */
 
+/*
+ * @file    Serial.c
+ * @brief   串口通信模块实现文件
+ * @author  Wanone111
+ * @note    该文件实现了 UART1 新版帧解析、CRC16 校验、UART2 简单帧解析和接收中断入口。
+ */
 
+#ifndef SERIAL_HOST_TEST
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
-volatile uint8_t RxData1;//接收数据变量
-volatile uint8_t RxData2;//接收数据变量
-volatile uint8_t data_len;//数据长度
-volatile uint8_t Serial_RxFlag1; //定义接收数据包标志位 USART1
+#endif
+
+volatile uint8_t RxData1;
+volatile uint8_t RxData2;
+volatile uint8_t Serial_RxFlag1;
 volatile uint8_t Serial_RxFlag2;
-uint8_t Serial_TxPacket1[MAX_FRAME_LEN]; //定义发送数据包数组，数据包格式：0F F0
-uint8_t Serial_RxPacket1[MAX_FRAME_LEN]; //定义接收数据包数组
-uint8_t Serial_TxPacket2[SERIAL2_BUF_LEN]; //定义发送数据包数组，数据包格式：FF 0F 03 FE
-uint8_t Serial_RxPacket2[SERIAL2_BUF_LEN]; //定义接收数据包数组
-float data[SERIAL1_MAX_DATA_COUNT];
+Serial Serial_RxFrame1;
+uint8_t Serial_RxPacket2[SERIAL2_FRAME_LEN];
 
-static void Serial1_ResetState(uint8_t *state, uint16_t *index, uint8_t *sum_buf, uint8_t *buffer)
-{
-    *state = 0;
-    *index = 0;
-    *sum_buf = 0;
-    memset(buffer, 0, MAX_FRAME_LEN);
-}
+static SerialParser s_uart1_parser;
 
-static void Serial2_ResetState(uint8_t *state, uint16_t *index, uint8_t *buffer)
+/*
+ * @brief  使用单个字节更新 CRC16/MODBUS 校验值。
+ * @param  crc: 当前 CRC 值。
+ * @param  byte: 要加入计算的字节。
+ * @retval uint16_t: 更新后的 CRC 值。
+ * @note   多字节 CRC 计算通过重复调用该函数完成。
+ */
+static uint16_t Serial_UpdateCrc16(uint16_t crc, uint8_t byte)
 {
-    *state = 0;
-    *index = 0;
-    memset(buffer, 0, SERIAL2_BUF_LEN);
-}
+    uint8_t i;
 
-/**
-  * 函数功能: 重定向c库函数printf到DEBUG_USARTx
-  * 输入参数: 无
-  * 返 回 值: 无
-  * 说    明：无
-  */
-int fputc(int ch, FILE *stream)
-{
-    uint8_t tx_ch = (uint8_t)ch;
-    (void)stream;
-    HAL_UART_Transmit(&huart2, &tx_ch, 1, 100);
-    return ch;
-}
-/**
-  * 函数功能: 重定向c库函数getchar,scanf到DEBUG_USARTx
-  * 输入参数: 无
-  * 返 回 值: 无
-  * 说    明：无
-  */
-int fgetc(FILE *f)
-{
-    uint8_t ch = 0;
-    (void)f;
-    HAL_UART_Receive(&huart2, &ch, 1, 100);
-    return ch;
-}
-/**
-  * 函    数：获取串口1接收数据包标志位
-  * 参    数：无
-  * 返 回 值：串口1接收数据包标志位，范围：0~1，接收到数据包后，标志位置1，读取后标志位自动清零
-  */
-uint8_t Serial_GetRxFlag1(void)
-{
-    if (Serial_RxFlag1 == 1) //如果标志位为1
+    crc ^= byte;
+    for (i = 0U; i < 8U; i++)
     {
-        Serial_RxFlag1 = 0;
-        return 1; //则返回1，并自动清零标志位
-    }
-
-    return 0; //如果标志位为0，则返回0
-}
-/**
-  * 函    数：获取串口2接收数据包标志位
-  * 参    数：无
-  * 返 回 值：串口2接收数据包标志位，范围：0~1，接收到数据包后，标志位置1，读取后标志位自动清零
-  */
-uint8_t Serial_GetRxFlag2(void)
-{
-    if (Serial_RxFlag2 == 1) //如果标志位为1
-    {
-        Serial_RxFlag2 = 0;
-        return 1; //则返回1，并自动清零标志位
-    }
-
-    return 0; //如果标志位为0，则返回0
-}
-/**
-  * 函数功能: 串口1处理数据
-  * 输入参数: 无
-  * 返 回 值: 无
-  * 说    明：无
-  */
-void uart1_data(void)
-{
-    if (Serial_GetRxFlag1() == 1)
-    {
-        const uint8_t packet_len = Serial_RxPacket1[0];
-        uint8_t count = 0;
-
-        printf("orin: ");
-        for (uint16_t i = 0; i <= packet_len; i++)  // 包括长度字节
+        if ((crc & 0x0001U) != 0U)
         {
-            printf("0x%02X ", Serial_RxPacket1[i]);
+            crc = (uint16_t)((crc >> 1U) ^ 0xA001U);
         }
-        printf("\r\n");
-
-        for (uint16_t i = 1; (i + 1U) <= packet_len && count < SERIAL1_MAX_DATA_COUNT; i += 2U)
+        else
         {
-            int16_t raw = (int16_t)(((uint16_t)Serial_RxPacket1[i] << 8) | Serial_RxPacket1[i + 1U]);
-            data[count++] = (float)raw / 1000.0f;
-        }
-
-        // 显示解析后的数据
-        printf(" (process%d):\r\n", count);
-        for (uint8_t i = 0; i < count; i++)
-        {
-            printf("data[%d] = %f\r\n", i, data[i]);
+            crc = (uint16_t)(crc >> 1U);
         }
     }
+
+    return crc;
 }
 
-
-
-/**
-  * 函数功能: 串口1接收数据
-  * 输入参数: 无
-  * 返 回 值: 无
-  * 说    明：无
-  */
-void UART1_RxPacket(void)
+/*
+ * @brief  清空串口帧结构体。
+ * @param  frame: 指向 Serial 结构体的指针。
+ * @retval None
+ */
+void Serial_FrameClear(Serial *frame)
 {
-    static uint8_t RxState1 = 0;      //定义表示当前状态机状态的静态变量
-    static uint16_t pRxPacket1 = 0;   //定义表示当前接收数据位置的静态变量
-    static uint8_t rx1_buf[MAX_FRAME_LEN]; //串口数据缓冲
-    static uint8_t sum_buf = 0;       //校验和缓冲区
-    const uint8_t rx_byte = RxData1;
-
-    switch (RxState1)
+    if (frame == NULL)
     {
-        case 0: //帧头1
-            if (rx_byte == SERIAL1_HEADER1)
-            {
-                pRxPacket1 = 0;
-                sum_buf = rx_byte;
-                RxState1 = 1;
-            }
-            break;
+        return;
+    }
 
-        case 1: //帧头2
-            if (rx_byte == SERIAL1_HEADER2)
-            {
-                sum_buf += rx_byte;
-                RxState1 = 2;
-            }
-            else if (rx_byte == SERIAL1_HEADER1)
-            {
-                sum_buf = rx_byte;
-            }
-            else
-            {
-                Serial1_ResetState(&RxState1, &pRxPacket1, &sum_buf, rx1_buf);
-            }
-            break;
+    memset(frame, 0, sizeof(*frame));
+}
 
-        case 2: //数据长度
-#if (MAX_FRAME_LEN < 256U)
-            if (rx_byte > (MAX_FRAME_LEN - 1U))
+/*
+ * @brief  初始化串口解析器。
+ * @param  parser: 指向 SerialParser 结构体的指针。
+ * @retval None
+ * @note   该函数会将解析器状态恢复到等待帧头 1。
+ */
+void Serial_ParserInit(SerialParser *parser)
+{
+    if (parser == NULL)
+    {
+        return;
+    }
+
+    memset(parser, 0, sizeof(*parser));
+    parser->state = PARSE_STATE_WAIT_HEADER1;
+    parser->crc_calc = 0xFFFFU;
+}
+
+/*
+ * @brief  计算 CRC16/MODBUS 校验值。
+ * @param  data: 要计算 CRC 的数据指针。
+ * @param  length: 数据长度。
+ * @retval uint16_t: 计算得到的 CRC16 值。
+ * @note   初始值为 0xFFFF，多项式为 0xA001。
+ */
+uint16_t Serial_CalcCrc16(const uint8_t *data, uint16_t length)
+{
+    uint16_t crc = 0xFFFFU;
+    uint16_t i;
+
+    if (data == NULL && length > 0U)
+    {
+        return 0U;
+    }
+
+    for (i = 0U; i < length; i++)
+    {
+        crc = Serial_UpdateCrc16(crc, data[i]);
+    }
+
+    return crc;
+}
+
+/*
+ * @brief  解析串口接收到的字节。
+ * @param  parser: 指向 SerialParser 结构体的指针。
+ * @param  byte: 要解析的字节。
+ * @param  frame: 指向 Serial 结构体的指针，用于存储解析后的帧数据。
+ * @retval LogStatus_t: LOG_STATUS_BUSY 表示解析中，LOG_STATUS_OK 表示成功解析一帧，其它值表示错误。
+ * @note   新版帧格式为 0x0F 0xF0 LEN DATA... CRC16_LOW CRC16_HIGH 0xFF。
+ */
+LogStatus_t Serial_ParseByte(SerialParser *parser, uint8_t byte, Serial *frame)
+{
+    if (parser == NULL || frame == NULL)
+    {
+        return LOG_STATUS_INVALID_PARAM;
+    }
+
+    switch (parser->state)
+    {
+        case PARSE_STATE_WAIT_HEADER1:
+            if (byte != SERIAL1_HEADER1)
             {
-                Serial1_ResetState(&RxState1, &pRxPacket1, &sum_buf, rx1_buf);
-                break;
+                return LOG_STATUS_BUSY;
+            }
+
+            parser->crc_calc = 0xFFFFU;
+            parser->crc_calc = Serial_UpdateCrc16(parser->crc_calc, byte);
+            parser->state = PARSE_STATE_WAIT_HEADER2;
+            return LOG_STATUS_BUSY;
+
+        case PARSE_STATE_WAIT_HEADER2:
+            if (byte != SERIAL1_HEADER2)
+            {
+                Serial_ParserInit(parser);
+                if (byte == SERIAL1_HEADER1)
+                {
+                    parser->crc_calc = Serial_UpdateCrc16(parser->crc_calc, byte);
+                    parser->state = PARSE_STATE_WAIT_HEADER2;
+                }
+                return LOG_STATUS_SERIAL_HEADER_ERROR;
+            }
+
+            parser->crc_calc = Serial_UpdateCrc16(parser->crc_calc, byte);
+            parser->state = PARSE_STATE_READ_LENGTH;
+            return LOG_STATUS_BUSY;
+
+        case PARSE_STATE_READ_LENGTH:
+#if (SERIAL1_MAX_DATA_LEN < 255U)
+            if (byte > SERIAL1_MAX_DATA_LEN)
+            {
+                Serial_ParserInit(parser);
+                return LOG_STATUS_SERIAL_LENGTH_ERROR;
             }
 #endif
 
-            rx1_buf[pRxPacket1++] = rx_byte;
-            data_len = rx_byte;
-            sum_buf += rx_byte;
-            RxState1 = (rx_byte == 0U) ? 4U : 3U;
-            break;
+            parser->length = byte;
+            parser->index = 0U;
+            parser->crc_index = 0U;
+            parser->crc_received = 0U;
+            parser->crc_calc = Serial_UpdateCrc16(parser->crc_calc, byte);
+            parser->state = (byte == 0U) ? PARSE_STATE_READ_CRC : PARSE_STATE_READ_DATA;
+            return LOG_STATUS_BUSY;
 
-        case 3: //数据内容
-            if (pRxPacket1 < MAX_FRAME_LEN)
+        case PARSE_STATE_READ_DATA:
+            if (parser->index >= SERIAL1_MAX_DATA_LEN)
             {
-                rx1_buf[pRxPacket1++] = rx_byte;
-                sum_buf += rx_byte;
-            }
-            else
-            {
-                Serial1_ResetState(&RxState1, &pRxPacket1, &sum_buf, rx1_buf);
-                break;
+                Serial_ParserInit(parser);
+                return LOG_STATUS_SERIAL_BUFFER_OVERFLOW;
             }
 
-            if (pRxPacket1 >= (1U + data_len))
+            parser->data[parser->index] = byte;
+            parser->index++;
+            parser->crc_calc = Serial_UpdateCrc16(parser->crc_calc, byte);
+            if (parser->index >= parser->length)
             {
-                RxState1 = 4;
+                parser->state = PARSE_STATE_READ_CRC;
             }
-            break;
+            return LOG_STATUS_BUSY;
 
-        case 4: //校验和
-        {
-            const uint8_t sum = sum_buf;
-            if (rx_byte == sum)
+        case PARSE_STATE_READ_CRC:
+            if (parser->crc_index == 0U)
             {
-                memcpy(Serial_RxPacket1, rx1_buf, pRxPacket1);
-                Serial_RxFlag1 = 1;
-            }
-            else
-            {
-                printf("Checksum error, expect 0x%02X, got 0x%02X\r\n", sum, rx_byte);
+                parser->crc_received = byte;
+                parser->crc_index = 1U;
+                return LOG_STATUS_BUSY;
             }
 
-            Serial1_ResetState(&RxState1, &pRxPacket1, &sum_buf, rx1_buf);
-            break;
-        }
+            parser->crc_received |= (uint16_t)((uint16_t)byte << 8U);
+            if (parser->crc_received != parser->crc_calc)
+            {
+                Serial_ParserInit(parser);
+                return LOG_STATUS_SERIAL_CRC_ERROR;
+            }
+
+            parser->state = PARSE_STATE_READ_TAIL;
+            return LOG_STATUS_BUSY;
+
+        case PARSE_STATE_READ_TAIL:
+            if (byte != SERIAL1_TAIL)
+            {
+                Serial_ParserInit(parser);
+                return LOG_STATUS_SERIAL_TAIL_ERROR;
+            }
+
+            Serial_FrameClear(frame);
+            frame->length = parser->length;
+            frame->crc = parser->crc_received;
+            if (parser->length > 0U)
+            {
+                memcpy(frame->data, parser->data, parser->length);
+            }
+            Serial_ParserInit(parser);
+            return LOG_STATUS_OK;
 
         default:
-            Serial1_ResetState(&RxState1, &pRxPacket1, &sum_buf, rx1_buf);
-            break;
+            Serial_ParserInit(parser);
+            return LOG_STATUS_ERROR;
     }
 }
-/**
-  * 函数功能: 串口2接收数据
-  * 输入参数: 无
-  * 返 回 值: 无
-  * 说    明：无
-  */
-void UART2_RxPacket(void)
+
+/*
+ * @brief  获取 UART1 接收完成标志。
+ * @param  None
+ * @retval uint8_t: 1 表示收到完整帧，0 表示没有新帧。
+ */
+uint8_t Serial_GetRxFlag1(void)
 {
-    static uint8_t RxState2 = 0; //定义表示当前状态机状态的静态变量
-    static uint16_t pRxPacket2 = 0; //定义表示当前接收数据位置的静态变量
-    static uint8_t rx2_buf[SERIAL2_BUF_LEN]; //定义表示接收串口2数据包的中间变量
-    const uint8_t rx_byte = RxData2;
-
-    switch (RxState2)
+    if (Serial_RxFlag1 != 0U)
     {
-        case 0:
-            if (rx_byte == SERIAL2_HEADER1)
-            {
-                RxState2 = 1;
-                pRxPacket2 = 1;
-                rx2_buf[0] = SERIAL2_HEADER1;
-            }
-            break;
+        Serial_RxFlag1 = 0U;
+        return 1U;
+    }
 
-        case 1:
-            if (rx_byte == SERIAL2_HEADER2)
-            {
-                RxState2 = 2;
-                pRxPacket2 = 2;
-                rx2_buf[1] = SERIAL2_HEADER2;
-            }
-            else
-            {
-                Serial2_ResetState(&RxState2, &pRxPacket2, rx2_buf);
-            }
-            break;
+    return 0U;
+}
 
-        case 2:
-            if (pRxPacket2 < SERIAL2_BUF_LEN)
-            {
-                rx2_buf[pRxPacket2++] = rx_byte;
-                RxState2 = 3;
-            }
-            else
-            {
-                Serial2_ResetState(&RxState2, &pRxPacket2, rx2_buf);
-            }
-            break;
+/*
+ * @brief  获取 UART2 接收完成标志。
+ * @param  None
+ * @retval uint8_t: 1 表示收到完整帧，0 表示没有新帧。
+ */
+uint8_t Serial_GetRxFlag2(void)
+{
+    if (Serial_RxFlag2 != 0U)
+    {
+        Serial_RxFlag2 = 0U;
+        return 1U;
+    }
 
-        case 3:
-            if (rx_byte == SERIAL2_TAIL && pRxPacket2 < SERIAL2_BUF_LEN)
+    return 0U;
+}
+
+/*
+ * @brief  处理 UART1 当前接收到的字节。
+ * @param  None
+ * @retval LogStatus_t: UART1 字节解析结果。
+ * @note   该函数只更新接收状态，不在中断中执行阻塞日志输出。
+ */
+LogStatus_t UART1_RxPacket(void)
+{
+    LogStatus_t status;
+
+    status = Serial_ParseByte(&s_uart1_parser, RxData1, &Serial_RxFrame1);
+    if (status == LOG_STATUS_OK)
+    {
+        Serial_RxFlag1 = 1U;
+    }
+
+    return status;
+}
+
+/*
+ * @brief  处理 UART2 当前接收到的字节。
+ * @param  None
+ * @retval LogStatus_t: UART2 字节解析结果。
+ * @note   UART2 当前采用 0xFF 0x0F DATA 0xFE 简单帧格式。
+ */
+LogStatus_t UART2_RxPacket(void)
+{
+    static uint8_t state;
+    static uint8_t index;
+
+    switch (state)
+    {
+        case 0U:
+            if (RxData2 == SERIAL2_HEADER1)
             {
-                rx2_buf[pRxPacket2++] = SERIAL2_TAIL;
-                memcpy(Serial_RxPacket2, rx2_buf, SERIAL2_FRAME_LEN);
-                Serial_RxFlag2 = 1;
+                Serial_RxPacket2[0] = RxData2;
+                index = 1U;
+                state = 1U;
             }
-            else
+            return LOG_STATUS_BUSY;
+
+        case 1U:
+            if (RxData2 != SERIAL2_HEADER2)
             {
-                memset(Serial_RxPacket2, 0, sizeof(Serial_RxPacket2));
+                state = 0U;
+                index = 0U;
+                return LOG_STATUS_SERIAL_HEADER_ERROR;
             }
 
-            Serial2_ResetState(&RxState2, &pRxPacket2, rx2_buf);
-            break;
+            Serial_RxPacket2[index] = RxData2;
+            index++;
+            state = 2U;
+            return LOG_STATUS_BUSY;
+
+        case 2U:
+            Serial_RxPacket2[index] = RxData2;
+            index++;
+            state = 3U;
+            return LOG_STATUS_BUSY;
+
+        case 3U:
+            if (RxData2 != SERIAL2_TAIL)
+            {
+                state = 0U;
+                index = 0U;
+                return LOG_STATUS_SERIAL_TAIL_ERROR;
+            }
+
+            Serial_RxPacket2[index] = RxData2;
+            Serial_RxFlag2 = 1U;
+            state = 0U;
+            index = 0U;
+            return LOG_STATUS_OK;
 
         default:
-            Serial2_ResetState(&RxState2, &pRxPacket2, rx2_buf);
-            break;
+            state = 0U;
+            index = 0U;
+            return LOG_STATUS_ERROR;
     }
 }
 
-
+#ifndef SERIAL_HOST_TEST
 /**
-  * 函数功能: 串口接收中断回调函数
-  * 输入参数: 无
-  * 返 回 值: 无
-  * 说    明：无
+  * @brief  串口接收中断回调函数。
+  * @param  huart: 串口句柄。
+  * @retval None
+  * @note   中断中只推进状态机并重新开启接收，不执行阻塞日志输出。
   */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
@@ -312,12 +353,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
     if (huart->Instance == USART1)
     {
-        UART1_RxPacket();
-        HAL_UART_Receive_IT(&huart1, (uint8_t *)&RxData1, 1);
+        (void)UART1_RxPacket();
+        (void)HAL_UART_Receive_IT(&huart1, (uint8_t *)&RxData1, 1U);
     }
     else if (huart->Instance == USART2)
     {
-        UART2_RxPacket();
-        HAL_UART_Receive_IT(&huart2, (uint8_t *)&RxData2, 1);
+        (void)UART2_RxPacket();
+        (void)HAL_UART_Receive_IT(&huart2, (uint8_t *)&RxData2, 1U);
+    }
+    else
+    {
+        /* 未使用的 UART 实例，不处理。 */
     }
 }
+#endif
