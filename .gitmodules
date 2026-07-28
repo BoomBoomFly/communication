@@ -1,0 +1,3 @@
+[submodule "Serial/serial_driver_ros"]
+	path = Serial/serial_driver_ros
+	url = https://github.com/BoomBoomFly/serial_driver_ros.git
