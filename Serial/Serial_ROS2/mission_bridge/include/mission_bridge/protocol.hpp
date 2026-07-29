@@ -79,6 +79,29 @@ struct CarProgressPayload
 };
 
 /*
+ * /mission/start/context (UInt64) 的原子伴随上下文。
+ * 位布局：mission_id[15:0] | session_id[23:16] | seq[31:24] |
+ * source_epoch[63:32]。
+ */
+struct StartContext
+{
+    uint16_t mission_id;
+    uint8_t session_id;
+    uint8_t seq;
+    uint32_t source_epoch;
+};
+
+constexpr uint32_t MISSION_ID_INVALID = 0U;
+constexpr uint32_t MISSION_ID_CONTEST_TASK1 = 1U;
+constexpr uint32_t MISSION_ID_CONTEST_TASK2 = 2U;
+constexpr uint32_t MISSION_ID_VERTICAL_TEST = 3U;
+
+/* 当前生产协议只允许上述三个非零任务编号。 */
+bool IsSupportedMissionId(uint32_t mission_id);
+uint64_t EncodeStartContext(const StartContext &context);
+StartContext DecodeStartContext(uint64_t encoded);
+
+/*
  * @brief  将阶段状态值转换为字符串。
  * @param  phase: 阶段状态值。
  * @retval 阶段状态对应的字符串，未知值返回 "UNKNOWN"。
@@ -93,6 +116,13 @@ const char *PhaseToString(uint8_t phase);
  * @retval true 表示解析成功，false 表示长度不足或消息类型非法。
  */
 bool DecodeHeader(const uint8_t *data, size_t len, MessageHeader &header);
+
+/*
+ * @brief  检查消息负载长度是否与类型的线协议契约完全一致。
+ * @note   使用精确长度而不是“至少长度”，避免带尾随字节的畸形 START
+ *         在会话状态机中产生副作用。
+ */
+bool IsPayloadLengthValid(MsgType type, size_t len);
 
 /*
  * @brief  解析 START 消息负载。

@@ -3,7 +3,7 @@
  * @brief   车端串口协议栈与 ROS2 桥接节点
  * @author  Wanone111
  * @note    该节点通过 ESP8266 串口透传与车端通信，负责应用层消息解析、
- *          (session, seq) 去重、session 隔离、心跳链路监测、PAYLOAD_RELEASE 应答，
+ *          (session, seq) 去重、session 隔离、心跳链路监测、PAYLOAD_RELEASE 兼容应答，
  *          并将车辆状态以 std_msgs 话题发布到 ROS2。
  */
 
@@ -21,12 +21,13 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 #include "rclcpp/rclcpp.hpp"
-#include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "std_msgs/msg/u_int32.hpp"
+#include "std_msgs/msg/u_int64.hpp"
 #include "std_msgs/msg/u_int8.hpp"
 
 #include "mission_bridge/bridge_state.hpp"
@@ -47,6 +48,18 @@ static std::int64_t SteadyNowNs()
         .count();
 }
 
+static uint32_t GenerateSourceEpoch()
+{
+    const uint64_t wall_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    const uint64_t steady_ns = static_cast<uint64_t>(SteadyNowNs());
+    const uint64_t mixed = wall_ns ^ (steady_ns << 1U) ^
+                           (static_cast<uint64_t>(::getpid()) << 17U);
+    uint32_t epoch = static_cast<uint32_t>(mixed ^ (mixed >> 32U));
+    return epoch == 0U ? 1U : epoch;
+}
+
 /*
  * @brief  车端串口协议栈桥接节点类。
  * @note   读线程阻塞读串口并逐字节喂 Serial_ParseByte，定时器线程负责链路监测与周期重发。
@@ -65,6 +78,8 @@ public:
         heartbeat_period_ms_ = declare_parameter<int>("protocol.heartbeat_period_ms", 1000);
         heartbeat_timeout_beats_ = declare_parameter<int>("protocol.heartbeat_timeout_beats", 3);
         dedup_window_size_ = declare_parameter<int>("protocol.dedup_window", 32);
+        const auto source_epoch_param =
+            declare_parameter<std::int64_t>("protocol.source_epoch", 0);
         if (heartbeat_period_ms_ < 1 || heartbeat_timeout_beats_ < 1)
         {
             throw std::invalid_argument("heartbeat period and timeout beats must be positive");
@@ -73,9 +88,22 @@ public:
         {
             dedup_window_size_ = 1;
         }
+        if (source_epoch_param < 0 ||
+            source_epoch_param > static_cast<std::int64_t>(UINT32_MAX))
+        {
+            throw std::invalid_argument("source_epoch must fit uint32; 0 means auto");
+        }
+        source_epoch_ = source_epoch_param == 0
+            ? GenerateSourceEpoch()
+            : static_cast<uint32_t>(source_epoch_param);
 
-        start_pub_ = create_publisher<std_msgs::msg::Bool>("/mission/start", 10);
-        mission_id_pub_ = create_publisher<std_msgs::msg::UInt32>("/mission/id", 10);
+        const auto start_event_qos = rclcpp::QoS(rclcpp::KeepLast(10))
+            .reliable().durability_volatile();
+        start_pub_ = create_publisher<std_msgs::msg::UInt32>(
+            "/mission/start", start_event_qos);
+        start_context_pub_ =
+            create_publisher<std_msgs::msg::UInt64>(
+                "/mission/start/context", start_event_qos);
         progress_pub_ = create_publisher<std_msgs::msg::Float32>("/car/progress", 10);
         speed_pub_ = create_publisher<std_msgs::msg::Float32>("/car/speed", 10);
         phase_pub_ = create_publisher<std_msgs::msg::UInt8>("/car/phase", 10);
@@ -101,9 +129,10 @@ public:
         read_thread_ = std::thread(&MissionBridgeNode::readLoop, this);
 
         RCLCPP_INFO(get_logger(),
-                    "mission_bridge 已启动: port=%s baudrate=%d hb_period=%dms timeout=%d beats dedup=%d",
+                    "mission_bridge 已启动: port=%s baudrate=%d hb_period=%dms timeout=%d beats "
+                    "dedup=%d source_epoch=%u",
                     port_.c_str(), baudrate_, heartbeat_period_ms_, heartbeat_timeout_beats_,
-                    dedup_window_size_);
+                    dedup_window_size_, source_epoch_);
     }
 
     /*
@@ -140,7 +169,7 @@ private:
     /*
      * @brief  读线程主循环：维护串口连接，逐字节解析并处理成帧。
      * @retval None
-     * @note   打开失败按 reconnect_interval_ms 重试（节流告警）；读错误发布 SERIAL_LOST 并重连。
+     * @note   打开失败按 reconnect_interval_ms 重试（节流告警）；读错误发布 SERIAL_DOWN 并重连。
      */
     void readLoop()
     {
@@ -152,13 +181,34 @@ private:
             {
                 if (!serial_.open(port_, baudrate_))
                 {
+                    bool publish_down = false;
+                    {
+                        std::lock_guard<std::mutex> lock(state_mutex_);
+                        publish_down = serial_state_.observe(false) ==
+                                       SerialTransition::DISCONNECTED;
+                    }
+                    if (publish_down)
+                    {
+                        publishFault("SERIAL_DOWN: open failed, reconnecting");
+                    }
                     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                                          "串口 %s 打开失败，%d ms 后重试",
                                          port_.c_str(), reconnect_interval_ms_);
                     sleepInterruptible(reconnect_interval_ms_);
                     continue;
                 }
+                bool was_observed = false;
+                SerialTransition serial_transition;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    was_observed = serial_state_.hasObservation();
+                    serial_transition = serial_state_.observe(true);
+                }
                 RCLCPP_INFO(get_logger(), "串口 %s @%d 已打开", port_.c_str(), baudrate_);
+                if (was_observed && serial_transition == SerialTransition::CONNECTED)
+                {
+                    publishFault("SERIAL_RECOVERED: port reconnected");
+                }
                 Serial_ParserInit(&parser_);
             }
 
@@ -170,7 +220,16 @@ private:
                     continue;
                 }
                 RCLCPP_ERROR(get_logger(), "串口读错误: %s，准备重连", std::strerror(errno));
-                publishFault("SERIAL_LOST: read error, reconnecting");
+                bool publish_down = false;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    publish_down = serial_state_.observe(false) ==
+                                   SerialTransition::DISCONNECTED;
+                }
+                if (publish_down)
+                {
+                    publishFault("SERIAL_DOWN: read error, reconnecting");
+                }
                 serial_.close();
                 sleepInterruptible(reconnect_interval_ms_);
                 continue;
@@ -226,18 +285,48 @@ private:
                                  "收到非法应用层消息，len=%u，已丢弃", frame.length);
             return;
         }
+        const size_t payload_len = frame.length - 3U;
+        if (!IsPayloadLengthValid(header.type, payload_len))
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            invalid_len_++;
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                 "消息负载长度非法: type=0x%02X len=%zu",
+                                 (unsigned)header.type, payload_len);
+            return;
+        }
 
+        uint32_t start_mission_id = 0U;
+        if (header.type == MsgType::START &&
+            !DecodeStart(frame.data + 3U, payload_len, start_mission_id))
+        {
+            return;
+        }
+        if (header.type == MsgType::START && !IsSupportedMissionId(start_mission_id))
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            invalid_payload_++;
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                 "拒绝不支持的 START mission_id=%u",
+                                 start_mission_id);
+            return;
+        }
+
+        bool session_replaced_while_link_up = false;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             const bool had_session = session_tracker_->hasSession();
             const uint8_t previous_session = session_tracker_->activeSession();
-            const auto decision = session_tracker_->observe(
-                header.type, header.session_id, header.seq);
-            if (decision == FrameDecision::SESSION_MISMATCH)
+            const auto decision = header.type == MsgType::START
+                ? session_tracker_->observeStart(
+                      header.session_id, header.seq, start_mission_id)
+                : session_tracker_->observe(header.type, header.session_id, header.seq);
+            if (decision == FrameDecision::SESSION_MISMATCH ||
+                decision == FrameDecision::STALE_SESSION)
             {
                 session_drop_++;
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                                     "丢弃 session 不匹配的帧: type=0x%02X session=%u (active=%u)",
+                                     "丢弃非活动/旧 session 帧: type=0x%02X session=%u (active=%u)",
                                      (unsigned)header.type, header.session_id,
                                      session_tracker_->activeSession());
                 return;
@@ -250,6 +339,8 @@ private:
             if (header.type == MsgType::START && had_session &&
                 previous_session != header.session_id)
             {
+                session_replaced_while_link_up =
+                    heartbeat_watchdog_->reset() == LinkTransition::DOWN;
                 RCLCPP_WARN(get_logger(),
                             "START 帧 session %u 替换当前 session %u，去重窗口已重置",
                             header.session_id, previous_session);
@@ -262,7 +353,11 @@ private:
             rx_++;
         }
 
-        dispatch(header, frame.data + 3U, frame.length - 3U);
+        if (session_replaced_while_link_up)
+        {
+            publishFault("LINK_DOWN: new session awaiting heartbeat");
+        }
+        dispatch(header, frame.data + 3U, payload_len);
     }
 
     /*
@@ -285,11 +380,16 @@ private:
                 }
                 RCLCPP_INFO(get_logger(), "收到 START: mission_id=%u session=%u",
                             mission_id, header.session_id);
-                std_msgs::msg::UInt32 id_msg;
-                id_msg.data = mission_id;
-                mission_id_pub_->publish(id_msg);
-                std_msgs::msg::Bool start_msg;
-                start_msg.data = true;
+                StartContext context{};
+                context.mission_id = static_cast<uint16_t>(mission_id);
+                context.session_id = header.session_id;
+                context.seq = header.seq;
+                context.source_epoch = source_epoch_;
+                std_msgs::msg::UInt64 context_msg;
+                context_msg.data = EncodeStartContext(context);
+                start_context_pub_->publish(context_msg);
+                std_msgs::msg::UInt32 start_msg;
+                start_msg.data = mission_id;
                 start_pub_->publish(start_msg);
                 break;
             }
@@ -360,7 +460,8 @@ private:
                     std::lock_guard<std::mutex> lock(state_mutex_);
                     last_release_id_ = (int)release_id;
                 }
-                sendPayloadAck(header.seq);
+                /* 协议兼容保留，但普通垂直阶段不执行任何投放动作。 */
+                sendPayloadAck(header.seq, 0x01U);
                 break;
             }
 
@@ -392,12 +493,13 @@ private:
     /*
      * @brief  发送 PAYLOAD_ACK 应答帧。
      * @param  acked_seq: 被应答帧的 SEQ。
+     * @param  result: 结果码；普通垂直阶段固定使用 0x01（unsupported）。
      * @retval None
-     * @note   acked_type 固定为 0x05（PAYLOAD_RELEASE），result 固定为 0x00 成功；串口写加互斥锁。
+     * @note   acked_type 固定为 0x05（PAYLOAD_RELEASE）；串口写加互斥锁。
      */
-    void sendPayloadAck(uint8_t acked_seq)
+    void sendPayloadAck(uint8_t acked_seq, uint8_t result)
     {
-        uint8_t payload[3] = {(uint8_t)MsgType::PAYLOAD_RELEASE, acked_seq, 0x00};
+        uint8_t payload[3] = {(uint8_t)MsgType::PAYLOAD_RELEASE, acked_seq, result};
         uint8_t active_session;
         {
             std::lock_guard<std::mutex> state_lock(state_mutex_);
@@ -479,8 +581,11 @@ private:
     void onStateTimer()
     {
         bool link_up;
+        bool serial_connected;
         bool session_set;
         uint8_t active_session;
+        uint8_t active_start_seq;
+        uint32_t active_mission_id;
         uint8_t phase;
         float progress_m;
         float speed_mps;
@@ -488,14 +593,20 @@ private:
         uint64_t rx;
         uint64_t dup;
         uint64_t crc_err;
+        uint64_t invalid_len;
+        uint64_t invalid_payload;
+        uint64_t session_drop;
         bool progress_seen;
         int last_release_id;
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             link_up = heartbeat_watchdog_->linkUp();
+            serial_connected = serial_state_.connected();
             session_set = session_tracker_->hasSession();
             active_session = session_tracker_->activeSession();
+            active_start_seq = session_tracker_->activeStartSeq();
+            active_mission_id = session_tracker_->activeMissionId();
             phase = phase_;
             progress_m = progress_m_;
             speed_mps = speed_mps_;
@@ -503,6 +614,9 @@ private:
             rx = rx_;
             dup = dup_;
             crc_err = crc_err_;
+            invalid_len = invalid_len_;
+            invalid_payload = invalid_payload_;
+            session_drop = session_drop_;
             progress_seen = progress_seen_;
             last_release_id = last_release_id_;
         }
@@ -527,13 +641,17 @@ private:
             std::snprintf(release_text, sizeof(release_text), "-");
         }
 
-        char text[192];
+        char text[288];
         std::snprintf(text, sizeof(text),
-                      "link=%s session=%s phase=%s progress_m=%.2f speed_mps=%.2f hb_seq=%u "
-                      "rx=%" PRIu64 " dup=%" PRIu64 " crc_err=%" PRIu64 " release=%s",
-                      link_up ? "up" : "down", session_text, PhaseToString(phase),
-                      (double)progress_m, (double)speed_mps, hb_seq, rx, dup, crc_err,
-                      release_text);
+                      "serial=%s link=%s source_epoch=%u session=%s mission_id=%u start_seq=%u phase=%s "
+                      "progress_m=%.2f speed_mps=%.2f hb_seq=%u rx=%" PRIu64
+                      " dup=%" PRIu64 " session_drop=%" PRIu64 " crc_err=%" PRIu64
+                      " invalid_len=%" PRIu64 " invalid_payload=%" PRIu64 " release=%s",
+                      serial_connected ? "up" : "down",
+                      (serial_connected && link_up) ? "up" : "down", source_epoch_,
+                      session_text, active_mission_id, active_start_seq, PhaseToString(phase),
+                      (double)progress_m, (double)speed_mps, hb_seq, rx, dup,
+                      session_drop, crc_err, invalid_len, invalid_payload, release_text);
 
         std_msgs::msg::String msg;
         msg.data = text;
@@ -567,10 +685,11 @@ private:
     int heartbeat_period_ms_;
     int heartbeat_timeout_beats_;
     int dedup_window_size_;
+    uint32_t source_epoch_{0U};
 
     /* 发布者 */
-    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr start_pub_;
-    rclcpp::Publisher<std_msgs::msg::UInt32>::SharedPtr mission_id_pub_;
+    rclcpp::Publisher<std_msgs::msg::UInt32>::SharedPtr start_pub_;
+    rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr start_context_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr progress_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr speed_pub_;
     rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr phase_pub_;
@@ -596,6 +715,7 @@ private:
     /* 可单元测试的 session、去重与心跳状态机 */
     std::unique_ptr<SessionTracker> session_tracker_;
     std::unique_ptr<HeartbeatWatchdog> heartbeat_watchdog_;
+    SerialConnectionState serial_state_;
 
     /* 最近一次车辆状态 */
     uint8_t phase_{PHASE_IDLE};
@@ -609,6 +729,8 @@ private:
     uint64_t rx_{0};
     uint64_t dup_{0};
     uint64_t crc_err_{0};
+    uint64_t invalid_len_{0};
+    uint64_t invalid_payload_{0};
     uint64_t session_drop_{0};
 };
 

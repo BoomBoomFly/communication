@@ -60,5 +60,9 @@ int main()
 
     encoded[4] ^= 0x01U;
     CHECK(parse(encoded, frame) == LOG_STATUS_SERIAL_CRC_ERROR);
+
+    std::vector<uint8_t> oversized(256U, 0xAAU);
+    CHECK(BuildFrame(oversized.data(), oversized.size()).empty());
+    CHECK(BuildMessage(MsgType::START, 1U, 1U, nullptr, 1U).empty());
     return 0;
 }

@@ -15,19 +15,14 @@ FrameDecision SessionTracker::observe(MsgType type, uint8_t session_id, uint8_t 
 {
     if (type == MsgType::START)
     {
-        if (!session_set_ || session_id != active_session_)
-        {
-            resetDedup();
-        }
-        active_session_ = session_id;
-        session_set_ = true;
+        return observeStart(session_id, seq, 0U);
     }
-    else if (!session_set_)
+
+    if (!session_set_)
     {
-        active_session_ = session_id;
-        session_set_ = true;
+        return FrameDecision::SESSION_MISMATCH;
     }
-    else if (session_id != active_session_)
+    if (session_id != active_session_)
     {
         return FrameDecision::SESSION_MISMATCH;
     }
@@ -38,6 +33,37 @@ FrameDecision SessionTracker::observe(MsgType type, uint8_t session_id, uint8_t 
     }
     remember(session_id, seq);
     return FrameDecision::ACCEPT;
+}
+
+FrameDecision SessionTracker::observeStart(
+    uint8_t session_id, uint8_t seq, uint32_t mission_id)
+{
+    if (session_set_)
+    {
+        /* 同 session 的任何 START 都是重放，即使发送方换了 seq/mission_id。 */
+        if (session_id == active_session_)
+        {
+            return FrameDecision::DUPLICATE;
+        }
+        if (!isNewerSession(session_id, active_session_))
+        {
+            return FrameDecision::STALE_SESSION;
+        }
+    }
+
+    resetDedup();
+    active_session_ = session_id;
+    active_start_seq_ = seq;
+    active_mission_id_ = mission_id;
+    session_set_ = true;
+    remember(session_id, seq);
+    return FrameDecision::ACCEPT;
+}
+
+bool SessionTracker::isNewerSession(uint8_t candidate, uint8_t current)
+{
+    const uint8_t delta = static_cast<uint8_t>(candidate - current);
+    return delta != 0U && delta < 128U;
 }
 
 bool SessionTracker::isDuplicate(uint8_t session_id, uint8_t seq) const
@@ -102,6 +128,32 @@ LinkTransition HeartbeatWatchdog::poll(std::int64_t now_ns)
         return LinkTransition::DOWN;
     }
     return LinkTransition::NONE;
+}
+
+LinkTransition HeartbeatWatchdog::reset()
+{
+    const bool was_up = link_up_;
+    last_heartbeat_ns_ = 0;
+    heartbeat_seq_ = 0;
+    heartbeat_seen_ = false;
+    link_up_ = false;
+    return was_up ? LinkTransition::DOWN : LinkTransition::NONE;
+}
+
+SerialTransition SerialConnectionState::observe(bool connected)
+{
+    if (!observed_)
+    {
+        observed_ = true;
+        connected_ = connected;
+        return connected ? SerialTransition::CONNECTED : SerialTransition::DISCONNECTED;
+    }
+    if (connected_ == connected)
+    {
+        return SerialTransition::NONE;
+    }
+    connected_ = connected;
+    return connected ? SerialTransition::CONNECTED : SerialTransition::DISCONNECTED;
 }
 
 } // namespace mission_bridge
