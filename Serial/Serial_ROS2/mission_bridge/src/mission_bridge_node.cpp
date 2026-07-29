@@ -14,18 +14,22 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "std_msgs/msg/u_int32.hpp"
 #include "std_msgs/msg/u_int8.hpp"
 
+#include "mission_bridge/bridge_state.hpp"
 #include "mission_bridge/protocol.hpp"
 #include "mission_bridge/serial_port.hpp"
 
@@ -35,6 +39,13 @@ extern "C" {
 
 namespace mission_bridge
 {
+
+static std::int64_t SteadyNowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 /*
  * @brief  车端串口协议栈桥接节点类。
@@ -54,20 +65,30 @@ public:
         heartbeat_period_ms_ = declare_parameter<int>("protocol.heartbeat_period_ms", 1000);
         heartbeat_timeout_beats_ = declare_parameter<int>("protocol.heartbeat_timeout_beats", 3);
         dedup_window_size_ = declare_parameter<int>("protocol.dedup_window", 32);
+        if (heartbeat_period_ms_ < 1 || heartbeat_timeout_beats_ < 1)
+        {
+            throw std::invalid_argument("heartbeat period and timeout beats must be positive");
+        }
         if (dedup_window_size_ < 1)
         {
             dedup_window_size_ = 1;
         }
 
-        start_pub_ = create_publisher<std_msgs::msg::UInt32>("/mission/start", 10);
+        start_pub_ = create_publisher<std_msgs::msg::Bool>("/mission/start", 10);
+        mission_id_pub_ = create_publisher<std_msgs::msg::UInt32>("/mission/id", 10);
         progress_pub_ = create_publisher<std_msgs::msg::Float32>("/car/progress", 10);
         speed_pub_ = create_publisher<std_msgs::msg::Float32>("/car/speed", 10);
         phase_pub_ = create_publisher<std_msgs::msg::UInt8>("/car/phase", 10);
-        state_pub_ = create_publisher<std_msgs::msg::String>("/mission/state", 10);
+        state_pub_ = create_publisher<std_msgs::msg::String>("/car/link_state", 10);
         fault_pub_ = create_publisher<std_msgs::msg::String>("/mission/fault", 10);
 
         Serial_ParserInit(&parser_);
-        dedup_window_.assign((size_t)dedup_window_size_, {0U, 0U});
+        session_tracker_ = std::make_unique<SessionTracker>(
+            static_cast<std::size_t>(dedup_window_size_));
+        const auto heartbeat_timeout_ns =
+            static_cast<std::int64_t>(heartbeat_timeout_beats_) *
+            static_cast<std::int64_t>(heartbeat_period_ms_) * 1000000LL;
+        heartbeat_watchdog_ = std::make_unique<HeartbeatWatchdog>(heartbeat_timeout_ns);
 
         link_timer_ = create_wall_timer(std::chrono::milliseconds(100),
                                         std::bind(&MissionBridgeNode::checkLinkTimeout, this));
@@ -208,47 +229,36 @@ private:
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-
-            /* session 隔离 */
-            if (header.type == MsgType::START)
+            const bool had_session = session_tracker_->hasSession();
+            const uint8_t previous_session = session_tracker_->activeSession();
+            const auto decision = session_tracker_->observe(
+                header.type, header.session_id, header.seq);
+            if (decision == FrameDecision::SESSION_MISMATCH)
             {
-                if (session_set_ && header.session_id != active_session_)
-                {
-                    RCLCPP_WARN(get_logger(), "START 帧 session %u 替换当前 session %u，去重窗口已重置",
-                                header.session_id, active_session_);
-                }
-                if (!session_set_ || header.session_id != active_session_)
-                {
-                    resetDedup();
-                }
-                active_session_ = header.session_id;
-                session_set_ = true;
+                session_drop_++;
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                     "丢弃 session 不匹配的帧: type=0x%02X session=%u (active=%u)",
+                                     (unsigned)header.type, header.session_id,
+                                     session_tracker_->activeSession());
+                return;
             }
-            else
-            {
-                if (!session_set_)
-                {
-                    active_session_ = header.session_id;
-                    session_set_ = true;
-                    RCLCPP_INFO(get_logger(), "从首个有效帧采纳 session=%u", active_session_);
-                }
-                else if (header.session_id != active_session_)
-                {
-                    session_drop_++;
-                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                                         "丢弃 session 不匹配的帧: type=0x%02X session=%u (active=%u)",
-                                         (unsigned)header.type, header.session_id, active_session_);
-                    return;
-                }
-            }
-
-            /* (session, seq) 去重 */
-            if (isDuplicate(header.session_id, header.seq))
+            if (decision == FrameDecision::DUPLICATE)
             {
                 dup_++;
                 return;
             }
-            pushDedup(header.session_id, header.seq);
+            if (header.type == MsgType::START && had_session &&
+                previous_session != header.session_id)
+            {
+                RCLCPP_WARN(get_logger(),
+                            "START 帧 session %u 替换当前 session %u，去重窗口已重置",
+                            header.session_id, previous_session);
+            }
+            else if (!had_session)
+            {
+                RCLCPP_INFO(get_logger(), "从首个有效帧采纳 session=%u",
+                            session_tracker_->activeSession());
+            }
             rx_++;
         }
 
@@ -275,9 +285,12 @@ private:
                 }
                 RCLCPP_INFO(get_logger(), "收到 START: mission_id=%u session=%u",
                             mission_id, header.session_id);
-                std_msgs::msg::UInt32 msg;
-                msg.data = mission_id;
-                start_pub_->publish(msg);
+                std_msgs::msg::UInt32 id_msg;
+                id_msg.data = mission_id;
+                mission_id_pub_->publish(id_msg);
+                std_msgs::msg::Bool start_msg;
+                start_msg.data = true;
+                start_pub_->publish(start_msg);
                 break;
             }
 
@@ -322,14 +335,14 @@ private:
                 {
                     return;
                 }
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                hb_seen_ = true;
-                last_hb_time_ = std::chrono::steady_clock::now();
-                hb_seq_ = heartbeat.hb_seq;
-                if (!link_up_)
                 {
-                    link_up_ = true;
-                    RCLCPP_INFO(get_logger(), "链路恢复: link up, hb_seq=%u", hb_seq_);
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    if (heartbeat_watchdog_->observe(
+                            SteadyNowNs(), heartbeat.hb_seq) == LinkTransition::UP)
+                    {
+                        RCLCPP_INFO(get_logger(), "链路恢复: link up, hb_seq=%u",
+                                    heartbeat.hb_seq);
+                    }
                 }
                 break;
             }
@@ -377,53 +390,6 @@ private:
     }
 
     /*
-     * @brief  查询 (session, seq) 是否已在去重窗口中。
-     * @param  session_id: 会话编号。
-     * @param  seq: 帧序号。
-     * @retval true 表示为重复帧。
-     * @note   调用方须已持有 state_mutex_。
-     */
-    bool isDuplicate(uint8_t session_id, uint8_t seq)
-    {
-        for (size_t i = 0; i < dedup_count_; i++)
-        {
-            if (dedup_window_[i].first == session_id && dedup_window_[i].second == seq)
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /*
-     * @brief  将 (session, seq) 写入去重环形窗口。
-     * @param  session_id: 会话编号。
-     * @param  seq: 帧序号。
-     * @retval None
-     * @note   调用方须已持有 state_mutex_。
-     */
-    void pushDedup(uint8_t session_id, uint8_t seq)
-    {
-        dedup_window_[dedup_head_] = {session_id, seq};
-        dedup_head_ = (dedup_head_ + 1U) % dedup_window_.size();
-        if (dedup_count_ < dedup_window_.size())
-        {
-            dedup_count_++;
-        }
-    }
-
-    /*
-     * @brief  重置去重窗口。
-     * @retval None
-     * @note   调用方须已持有 state_mutex_。
-     */
-    void resetDedup()
-    {
-        dedup_head_ = 0U;
-        dedup_count_ = 0U;
-    }
-
-    /*
      * @brief  发送 PAYLOAD_ACK 应答帧。
      * @param  acked_seq: 被应答帧的 SEQ。
      * @retval None
@@ -432,8 +398,13 @@ private:
     void sendPayloadAck(uint8_t acked_seq)
     {
         uint8_t payload[3] = {(uint8_t)MsgType::PAYLOAD_RELEASE, acked_seq, 0x00};
+        uint8_t active_session;
+        {
+            std::lock_guard<std::mutex> state_lock(state_mutex_);
+            active_session = session_tracker_->activeSession();
+        }
         std::lock_guard<std::mutex> lock(write_mutex_);
-        std::vector<uint8_t> frame = BuildMessage(MsgType::PAYLOAD_ACK, active_session_,
+        std::vector<uint8_t> frame = BuildMessage(MsgType::PAYLOAD_ACK, active_session,
                                                   tx_seq_++, payload, sizeof(payload));
         if (frame.empty())
         {
@@ -486,28 +457,24 @@ private:
      */
     void checkLinkTimeout()
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        if (!link_up_ || !hb_seen_)
         {
-            return;
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (heartbeat_watchdog_->poll(SteadyNowNs()) != LinkTransition::DOWN)
+            {
+                return;
+            }
         }
-
-        auto timeout = std::chrono::milliseconds((int64_t)heartbeat_timeout_beats_ * heartbeat_period_ms_);
-        if (std::chrono::steady_clock::now() - last_hb_time_ > timeout)
-        {
-            link_up_ = false;
-            char text[96];
-            std::snprintf(text, sizeof(text), "LINK_DOWN: heartbeat timeout after %d beats",
-                          heartbeat_timeout_beats_);
-            RCLCPP_WARN(get_logger(), "%s", text);
-            publishFault(text);
-        }
+        char text[96];
+        std::snprintf(text, sizeof(text), "LINK_DOWN: heartbeat timeout after %d beats",
+                      heartbeat_timeout_beats_);
+        RCLCPP_WARN(get_logger(), "%s", text);
+        publishFault(text);
     }
 
     /*
      * @brief  状态发布定时器回调（10Hz）。
      * @retval None
-     * @note   发布 /mission/state 紧凑单行状态，并重发最近一次里程/速度保证 >=10Hz。
+     * @note   发布 /car/link_state 紧凑单行状态，并重发最近一次里程/速度保证 >=10Hz。
      */
     void onStateTimer()
     {
@@ -526,13 +493,13 @@ private:
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            link_up = link_up_;
-            session_set = session_set_;
-            active_session = active_session_;
+            link_up = heartbeat_watchdog_->linkUp();
+            session_set = session_tracker_->hasSession();
+            active_session = session_tracker_->activeSession();
             phase = phase_;
             progress_m = progress_m_;
             speed_mps = speed_mps_;
-            hb_seq = hb_seq_;
+            hb_seq = heartbeat_watchdog_->heartbeatSeq();
             rx = rx_;
             dup = dup_;
             crc_err = crc_err_;
@@ -602,7 +569,8 @@ private:
     int dedup_window_size_;
 
     /* 发布者 */
-    rclcpp::Publisher<std_msgs::msg::UInt32>::SharedPtr start_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr start_pub_;
+    rclcpp::Publisher<std_msgs::msg::UInt32>::SharedPtr mission_id_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr progress_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr speed_pub_;
     rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr phase_pub_;
@@ -625,20 +593,9 @@ private:
     std::mutex state_mutex_;
     std::mutex write_mutex_;
 
-    /* session 隔离 */
-    bool session_set_{false};
-    uint8_t active_session_{0};
-
-    /* (session, seq) 去重环形窗口 */
-    std::vector<std::pair<uint8_t, uint8_t>> dedup_window_;
-    size_t dedup_head_{0};
-    size_t dedup_count_{0};
-
-    /* 链路状态 */
-    bool link_up_{false};
-    bool hb_seen_{false};
-    std::chrono::steady_clock::time_point last_hb_time_{};
-    uint16_t hb_seq_{0};
+    /* 可单元测试的 session、去重与心跳状态机 */
+    std::unique_ptr<SessionTracker> session_tracker_;
+    std::unique_ptr<HeartbeatWatchdog> heartbeat_watchdog_;
 
     /* 最近一次车辆状态 */
     uint8_t phase_{PHASE_IDLE};
