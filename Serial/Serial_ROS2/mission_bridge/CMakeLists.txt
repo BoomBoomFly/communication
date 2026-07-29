@@ -23,21 +23,34 @@ set(MISSION_BRIDGE_SERIAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../Serial_32/src/Se
 set_source_files_properties(${MISSION_BRIDGE_SERIAL_SRC}
   PROPERTIES COMPILE_DEFINITIONS SERIAL_HOST_TEST)
 
-add_executable(mission_bridge_node
-  src/mission_bridge_node.cpp
+add_library(mission_bridge_core
   src/protocol.cpp
-  src/serial_port.cpp
+  src/bridge_state.cpp
   ${MISSION_BRIDGE_COMMON_SRC}
   ${MISSION_BRIDGE_SERIAL_SRC}
 )
 
-target_include_directories(mission_bridge_node PRIVATE
+target_include_directories(mission_bridge_core PUBLIC
   include
   ${CMAKE_CURRENT_SOURCE_DIR}/../../../common/include
   ${CMAKE_CURRENT_SOURCE_DIR}/../../Serial_32/include
 )
 
+add_executable(mission_bridge_node
+  src/mission_bridge_node.cpp
+  src/serial_port.cpp
+)
+target_link_libraries(mission_bridge_node mission_bridge_core)
+target_include_directories(mission_bridge_node PRIVATE include)
 ament_target_dependencies(mission_bridge_node rclcpp std_msgs)
+
+if(BUILD_TESTING)
+  foreach(test_name protocol crc session heartbeat)
+    add_executable(test_${test_name} test/test_${test_name}.cpp)
+    target_link_libraries(test_${test_name} mission_bridge_core)
+    add_test(NAME test_${test_name} COMMAND test_${test_name})
+  endforeach()
+endif()
 
 install(TARGETS mission_bridge_node
   DESTINATION lib/${PROJECT_NAME})
