@@ -1,0 +1,10 @@
+# mission_bridge 节点参数配置，风格参照 Serial/serial_driver_ros/config/serial_config.yaml。
+# 键名必须与节点名一致（launch 中节点名为 mission_bridge）。
+mission_bridge:
+  ros__parameters:
+    serial.port: "/dev/ttyUSB0"
+    serial.baudrate: 115200
+    serial.reconnect_interval_ms: 2000
+    protocol.heartbeat_period_ms: 1000
+    protocol.heartbeat_timeout_beats: 3
+    protocol.dedup_window: 32
