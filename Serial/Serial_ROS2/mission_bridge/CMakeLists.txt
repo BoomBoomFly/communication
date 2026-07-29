@@ -45,11 +45,17 @@ target_include_directories(mission_bridge_node PRIVATE include)
 ament_target_dependencies(mission_bridge_node rclcpp std_msgs)
 
 if(BUILD_TESTING)
-  foreach(test_name protocol crc session heartbeat)
+  enable_testing()
+  foreach(test_name protocol crc session heartbeat start serial_connection)
     add_executable(test_${test_name} test/test_${test_name}.cpp)
     target_link_libraries(test_${test_name} mission_bridge_core)
     add_test(NAME test_${test_name} COMMAND test_${test_name})
   endforeach()
+  add_test(
+    NAME test_source_contract
+    COMMAND ${CMAKE_COMMAND}
+      -DNODE_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/mission_bridge_node.cpp
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/test/check_source_contract.cmake)
 endif()
 
 install(TARGETS mission_bridge_node

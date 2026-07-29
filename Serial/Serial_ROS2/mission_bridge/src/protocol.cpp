@@ -70,6 +70,31 @@ const char *PhaseToString(uint8_t phase)
     }
 }
 
+bool IsSupportedMissionId(uint32_t mission_id)
+{
+    return mission_id == MISSION_ID_CONTEST_TASK1 ||
+           mission_id == MISSION_ID_CONTEST_TASK2 ||
+           mission_id == MISSION_ID_VERTICAL_TEST;
+}
+
+uint64_t EncodeStartContext(const StartContext &context)
+{
+    return static_cast<uint64_t>(context.mission_id) |
+           (static_cast<uint64_t>(context.session_id) << 16U) |
+           (static_cast<uint64_t>(context.seq) << 24U) |
+           (static_cast<uint64_t>(context.source_epoch) << 32U);
+}
+
+StartContext DecodeStartContext(uint64_t encoded)
+{
+    StartContext context{};
+    context.mission_id = static_cast<uint16_t>(encoded & 0xFFFFU);
+    context.session_id = static_cast<uint8_t>((encoded >> 16U) & 0xFFU);
+    context.seq = static_cast<uint8_t>((encoded >> 24U) & 0xFFU);
+    context.source_epoch = static_cast<uint32_t>((encoded >> 32U) & 0xFFFFFFFFU);
+    return context;
+}
+
 bool DecodeHeader(const uint8_t *data, size_t len, MessageHeader &header)
 {
     if (data == nullptr || len < 3U)
@@ -89,9 +114,24 @@ bool DecodeHeader(const uint8_t *data, size_t len, MessageHeader &header)
     return true;
 }
 
+bool IsPayloadLengthValid(MsgType type, size_t len)
+{
+    switch (type)
+    {
+        case MsgType::START:           return len == 4U;
+        case MsgType::CAR_STATE:       return len == 1U;
+        case MsgType::CAR_PROGRESS:    return len == 8U;
+        case MsgType::HEARTBEAT:       return len == 7U;
+        case MsgType::PAYLOAD_RELEASE: return len == 1U;
+        case MsgType::PAYLOAD_ACK:     return len == 3U;
+        case MsgType::MISSION_ABORT:   return len == 1U;
+        default:                       return false;
+    }
+}
+
 bool DecodeStart(const uint8_t *payload, size_t len, uint32_t &mission_id)
 {
-    if (payload == nullptr || len < 4U)
+    if (payload == nullptr || len != 4U)
     {
         return false;
     }
@@ -102,7 +142,7 @@ bool DecodeStart(const uint8_t *payload, size_t len, uint32_t &mission_id)
 
 bool DecodeCarState(const uint8_t *payload, size_t len, uint8_t &phase)
 {
-    if (payload == nullptr || len < 1U)
+    if (payload == nullptr || len != 1U)
     {
         return false;
     }
@@ -113,7 +153,7 @@ bool DecodeCarState(const uint8_t *payload, size_t len, uint8_t &phase)
 
 bool DecodeCarProgress(const uint8_t *payload, size_t len, CarProgressPayload &progress)
 {
-    if (payload == nullptr || len < 8U)
+    if (payload == nullptr || len != 8U)
     {
         return false;
     }
@@ -125,7 +165,7 @@ bool DecodeCarProgress(const uint8_t *payload, size_t len, CarProgressPayload &p
 
 bool DecodeHeartbeat(const uint8_t *payload, size_t len, HeartbeatPayload &heartbeat)
 {
-    if (payload == nullptr || len < 7U)
+    if (payload == nullptr || len != 7U)
     {
         return false;
     }
@@ -138,7 +178,7 @@ bool DecodeHeartbeat(const uint8_t *payload, size_t len, HeartbeatPayload &heart
 
 bool DecodePayloadRelease(const uint8_t *payload, size_t len, uint8_t &release_id)
 {
-    if (payload == nullptr || len < 1U)
+    if (payload == nullptr || len != 1U)
     {
         return false;
     }
@@ -149,7 +189,7 @@ bool DecodePayloadRelease(const uint8_t *payload, size_t len, uint8_t &release_i
 
 bool DecodeMissionAbort(const uint8_t *payload, size_t len, uint8_t &reason)
 {
-    if (payload == nullptr || len < 1U)
+    if (payload == nullptr || len != 1U)
     {
         return false;
     }

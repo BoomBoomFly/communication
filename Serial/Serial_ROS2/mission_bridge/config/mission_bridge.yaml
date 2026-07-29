@@ -8,3 +8,5 @@ mission_bridge:
     protocol.heartbeat_period_ms: 1000
     protocol.heartbeat_timeout_beats: 3
     protocol.dedup_window: 32
+    # 0 = 每次进程启动自动生成非零 epoch；测试可显式固定。
+    protocol.source_epoch: 0

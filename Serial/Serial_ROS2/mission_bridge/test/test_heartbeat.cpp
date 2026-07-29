@@ -35,5 +35,10 @@ int main()
     CHECK(watchdog.observe(15'000'000'000LL, 41U) == LinkTransition::UP);
     CHECK(watchdog.observe(16'000'000'000LL, 42U) == LinkTransition::NONE);
     CHECK(watchdog.poll(18'999'999'999LL) == LinkTransition::NONE);
+    CHECK(watchdog.reset() == LinkTransition::DOWN);
+    CHECK(!watchdog.linkUp());
+    CHECK(!watchdog.hasHeartbeat());
+    CHECK(watchdog.poll(30'000'000'000LL) == LinkTransition::NONE);
+    CHECK(watchdog.reset() == LinkTransition::NONE);
     return 0;
 }

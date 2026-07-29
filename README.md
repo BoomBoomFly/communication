@@ -95,7 +95,7 @@ STM32F103C8T6 常见引脚映射：
 
 ### 应用层协议（第0步）
 
-所有消息 DATA 区前 3 字节为公共头 `MSG_TYPE(1B) | SESSION_ID(1B) | SEQ(1B)`，随后为各类型负载（多字节字段全部小端）：
+所有消息 DATA 区前 3 字节为公共头 `MSG_TYPE(1B) | SESSION_ID(1B) | SEQ(1B)`，随后为各类型负载（多字节字段全部小端）。负载长度必须与下表完全一致；尾随字节也视为非法帧，且非法帧不得改变当前 session。
 
 | MSG_TYPE | 名称 | 负载 |
 | --- | --- | --- |
@@ -107,16 +107,27 @@ STM32F103C8T6 常见引脚映射：
 | 0x06 | PAYLOAD_ACK | acked_type u8 + acked_seq u8 + result u8 |
 | 0x07 | MISSION_ABORT | reason u8 |
 
-### 话题接口（全部为发布者，std_msgs）
+`START.mission_id` 固定定义为：`0` 无效、`1` 赛题任务 1、`2` 赛题任务 2、`3` 普通垂直测试（VERTICAL_TEST）。`mission_bridge` 只负责验证新 session/seq 并转发任务编号，不负责 Arm、飞行控制、投放或动态降落。
+
+session 和 seq 均为 u8。第一个合法 START 建立 session；之后只有按模 256 前进 `1..127` 的新 session 才能替换当前 session。相同 session 的任何 START（包括更换 seq 或 mission_id）都按重放丢弃，旧/模糊 session 也丢弃。非 START 帧必须属于已由 START 建立的活动 session，并在该 session 的滑动窗口内按 `(session_id, seq)` 去重。发送端应在一次任务开始前递增 session，且不得一次跨越 128 个 session。
+
+### 话题接口
+
+节点没有 ROS 订阅；输入仅来自配置的真实串口。下列接口全部是 `mission_bridge` 的 ROS 发布输出：
 
 | 话题 | 类型 | 说明 |
 | --- | --- | --- |
-| `/mission/start` | UInt32 | 收到 START 帧时事件发布 mission_id |
+| `/mission/start` | `std_msgs/msg/UInt32` | 仅在接受新 session 的 START 时发布一次 mission_id；重复/旧 session 不发布 |
+| `/mission/start/context` | `std_msgs/msg/UInt64` | 紧邻 START 之前发布的原子上下文，编码 source_epoch/session_id/seq/mission_id |
 | `/car/progress` | Float32 | 里程（米），CAR_PROGRESS 事件转发 + 10Hz 定时重发 |
 | `/car/speed` | Float32 | 速度（m/s），CAR_PROGRESS 事件转发 + 10Hz 定时重发 |
 | `/car/phase` | UInt8 | CAR_STATE 事件发布 + 按心跳周期定时重发 |
-| `/mission/state` | String | 10Hz 紧凑单行状态，如 `link=up session=2 phase=RUNNING progress_m=12.34 speed_mps=1.23 hb_seq=41 rx=123 dup=2 crc_err=0` |
-| `/mission/fault` | String | 故障事件发布，如 `LINK_DOWN: heartbeat timeout after 3 beats`、`MISSION_ABORT: reason=3`、`SERIAL_LOST: read error, reconnecting` |
+| `/car/link_state` | String | 10Hz 状态，例如 `serial=up link=up session=2 mission_id=3 start_seq=41 phase=RUNNING ...` |
+| `/mission/fault` | String | 边沿事件：`SERIAL_DOWN`、`SERIAL_RECOVERED`、`LINK_DOWN` 或 `MISSION_ABORT` |
+
+`/mission/start/context` 位布局为：`mission_id[15:0] | session_id[23:16] | seq[31:24] | source_epoch[63:32]`。context 与 START 均使用默认 volatile QoS；bridge 先发布 context，随后立即发布 UInt32 START。消费端必须缓存 context 的单调接收时刻，只有在 mission_id 匹配、context/START 接收间隔满足自身 freshness、source_epoch 符合当前 bridge 实例、且 `(session_id, seq)` 未见过时才接受 START。bridge 每次启动生成非零 source_epoch；`protocol.source_epoch` 仅供隔离测试显式固定，生产保持 0（自动生成）。这使消费端能在 bridge 重启后拒绝迟到的旧 epoch 事件。
+
+状态中的 `serial` 仅表示设备文件连接；`link=up` 要求串口已连接且活动 session 的 HEARTBEAT 新鲜。`dup` 是重复帧数，`session_drop` 是未建 session、非活动 session 或旧 session 的丢弃数，`crc_err` 是传输层 CRC/帧尾/长度错误数，`invalid_len` 是应用层精确长度错误数，`invalid_payload` 是不支持的 START mission_id 等负载语义错误数。mission_id 为 0 或不在 1..3 内时不建立/替换 session，也不发布 START。
 
 ### 参数
 
@@ -128,6 +139,7 @@ STM32F103C8T6 常见引脚映射：
 | `protocol.heartbeat_period_ms` | int | `1000` | 心跳周期（也用作 phase 重发周期） |
 | `protocol.heartbeat_timeout_beats` | int | `3` | 心跳超时拍数，超时判定为 LINK_DOWN |
 | `protocol.dedup_window` | int | `32` | (session, seq) 去重环形窗口大小 |
+| `protocol.source_epoch` | int64 | `0` | 0=进程启动自动生成；非零仅用于隔离测试固定 epoch |
 
 ### 构建与运行
 
@@ -143,9 +155,15 @@ ros2 launch mission_bridge mission_bridge.launch.py
 
 ### 节点核心行为
 
-- 专用读线程阻塞读串口，逐字节喂 `Serial_ParseByte()`；CRC 等帧错误只计数。读失败发布 `SERIAL_LOST` fault 并按 `reconnect_interval_ms` 重连（打开失败用节流告警避免刷屏）。
+- 专用读线程阻塞读串口，逐字节喂 `Serial_ParseByte()`；CRC 等帧错误只计数。首次打开失败或已连接后的读失败发布一次 `SERIAL_DOWN`，恢复后发布一次 `SERIAL_RECOVERED`，持续失败不刷屏，并按 `reconnect_interval_ms` 重连。
 - 维护最近 N 个 (session, seq) 的环形去重窗口（N=`dedup_window`），重复帧丢弃并计 dup。
-- session 隔离：START 帧总是采纳其 session（替换旧 session 时重置去重窗口并告警）；非 START 帧在 session 不匹配时丢弃，未设置时从首个有效帧采纳。
+- session 隔离：只有合法 START 能建立 session；同 session START、旧 session START 以及未建立/不匹配 session 的其他帧均丢弃。接受新 session 时重置去重和心跳状态，等待该 session 的新 HEARTBEAT。
 - 心跳超时（默认 3s）未收到 HEARTBEAT → link 置 down 并发布一次 `LINK_DOWN` fault；收到心跳恢复 up。链路判定只看 HEARTBEAT 帧。
-- 收到 PAYLOAD_RELEASE 立即回 PAYLOAD_ACK（acked_type=0x05、acked_seq=对端 SEQ、result=0x00）。
+- PAYLOAD_RELEASE 仅保留线协议兼容：本阶段不驱动任何执行器，收到后回 PAYLOAD_ACK（acked_type=0x05、acked_seq=对端 SEQ、result=0x01 unsupported）。
 - 收到 MISSION_ABORT 发布 fault 并记日志。
+
+### 自动测试
+
+CTest 覆盖 CRC16/损坏帧、非法/尾随长度、START 编解码与 UInt32 源码契约、重复帧、session 隔离与 u8 回绕、旧 session 拒绝、心跳超时/恢复/reset、串口断开/重连边沿，以及禁止 `/fmu/in/*` writer/RC 伪造的源码契约。`serial_driver_ros` 继续由 `COLCON_IGNORE` 隔离。
+
+普通垂直飞行阶段不实现 payload release 执行动作和动态降落；上述消息类型仅为后续协议兼容保留。
