@@ -81,7 +81,7 @@ STM32F103C8T6 常见引脚映射：
 
 ## Serial_ROS2（mission_bridge）
 
-`Serial/Serial_ROS2/mission_bridge` 是 ROS2（foxy，ament_cmake，C++17）功能包，实现车端（ESP8266 串口透传）与 ROS2 之间的协议栈桥接节点。传输层帧格式与 STM32 端一致（`0x0F 0xF0 LEN DATA... CRC16_LO CRC16_HI 0xFF`），直接复用 `common` 和 `Serial_32` 的解析代码（`Serial.c` 以 `-DSERIAL_HOST_TEST` 编译脱离 STM32 HAL）。
+`Serial/Serial_ROS2/mission_bridge` 是 ROS2（foxy，ament_cmake，C++17）功能包，实现车端（ESP8266 串口透传）与 ROS2 之间的协议栈桥接节点。传输层帧格式与 STM32 端一致（`0x0F 0xF0 LEN DATA... CRC16_LO CRC16_HI 0xFF`），直接复用 `common` 和 `Serial_32` 的解析代码（`Serial.c` 以 `-DSERIAL_HOST_TEST` 编译脱离 STM32 HAL）。协议规范文档见 [`docs/car_link_protocol.md`](docs/car_link_protocol.md)。
 
 ### 包结构
 
